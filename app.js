@@ -17,7 +17,10 @@ app.use(express.json());
 app.use(cookieParser());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(fileUpload());
-app.use(cors());
+app.use(cors({
+  origin: "http://localhost:3000", // Change to frontend URL
+  credentials: true, // Allows cookies to be sent
+}));
 
 // Route Imports
 const product = require("./routes/productRoute");
@@ -30,11 +33,12 @@ app.use("/api/v1", user);
 app.use("/api/v1", order);
 app.use("/api/v1", payment);
 
-app.get("/",(req,res) => {
+app.get("/", (req, res) => {
+  console.log("qwertyui")
   res.json("working")
 })
 
 // Middleware for Errors
-app.use(errorMiddleware);
+//app.use(errorMiddleware);
 
 module.exports = app;

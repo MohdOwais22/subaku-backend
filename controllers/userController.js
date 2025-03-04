@@ -7,54 +7,160 @@ const crypto = require("crypto");
 const cloudinary = require("cloudinary");
 
 const axios = require("axios");
+const { log } = require("console");
+
+// Helper function for Cloudinary upload with retry logic
+const uploadWithRetry = async (image, options, maxRetries = 3) => {
+  let attempts = 0;
+
+  while (attempts < maxRetries) {
+    try {
+      return await cloudinary.v2.uploader.upload(image, options);
+    } catch (error) {
+      attempts++;
+      console.log(`Upload attempt ${attempts} failed. Error: ${error}`);
+
+      if (attempts === maxRetries) {
+        throw error;
+      }
+
+      // Exponential backoff (2s, 4s, 8s, etc.)
+      const backoffTime = 2000 * Math.pow(2, attempts);
+      console.log(`Retrying in ${backoffTime / 1000} seconds...`);
+      await new Promise(resolve => setTimeout(resolve, backoffTime));
+    }
+  }
+};
 
 // Register a User
 exports.registerUser = catchAsyncErrors(async (req, res, next) => {
-  const myCloud = await cloudinary.v2.uploader.upload(req.body.avatar, {
-    folder: "avatars",
-    width: 150,
-    crop: "scale",
-  });
+  console.log("Before");
 
-  const { name, email, password } = req.body;
+  try {
+    // Use the retry function for more reliable uploads
+    const myCloud = await uploadWithRetry(req.body.avatar, {
+      folder: "avatars",
+      width: 150,
+      crop: "scale",
+      quality: "auto", // Automatically adjusts quality
+      fetch_format: "auto", // Ensures optimal format
+      timeout: 300000, // Increased timeout to 5 minutes
+      chunk_size: 6000000, // Enable chunked uploads for large files (6MB chunks)
+      resource_type: "auto" // Handle different file types automatically
+    });
 
-  const user = await User.create({
-    name,
-    email,
-    password,
-    avatar: {
-      public_id: myCloud.public_id,
-      url: myCloud.secure_url,
-    },
-  });
+    console.log(myCloud);
 
-  sendToken(user, 201, res);
+    const { name, email, password } = req.body;
+    console.log("UserName", name);
+
+    const user = await User.create({
+      name,
+      email,
+      password,
+      avatar: {
+        public_id: myCloud.public_id,
+        url: myCloud.secure_url,
+      },
+    });
+
+    console.log("After User Creation");
+
+    sendToken(user, 201, res);
+  } catch (error) {
+    console.error("Error:", error);
+
+    // Provide more specific error messages for common upload issues
+    if (error.http_code === 429) {
+      return res.status(429).json({
+        success: false,
+        error: "Too many upload requests. Please try again later."
+      });
+    }
+
+    if (error.http_code === 413) {
+      return res.status(413).json({
+        success: false,
+        error: "Image is too large. Please upload a smaller image (max 10MB)."
+      });
+    }
+
+    return res.status(500).json({ success: false, error: error.message });
+  }
 });
+
 
 // Login User
 exports.loginUser = catchAsyncErrors(async (req, res, next) => {
   const { email, password } = req.body;
 
-  // checking if user has given password and email both
-
+  // Check if email and password are provided
   if (!email || !password) {
     return next(new ErrorHander("Please Enter Email & Password", 400));
   }
 
+  // Find user in database
   const user = await User.findOne({ email }).select("+password");
 
   if (!user) {
     return next(new ErrorHander("Invalid email or password", 401));
   }
 
+  // Check if password matches
   const isPasswordMatched = await user.comparePassword(password);
 
   if (!isPasswordMatched) {
     return next(new ErrorHander("Invalid email or password", 401));
   }
 
-  sendToken(user, 200, res);
+  // Set token in cookie
+  const token = user.getJWTToken();
+
+  // Cookie options
+  const options = {
+    expires: new Date(
+      Date.now() + process.env.COOKIE_EXPIRE * 24 * 60 * 60 * 1000
+    ),
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production", // Secure only in production
+    sameSite: process.env.NODE_ENV === "production" ? "None" : "Lax",
+  };
+
+  // Set the cookie properly
+  res.cookie("token", token, options);
+  console.log('Setting cookie with options:', options);
+  console.log('Cookie headers:', res.getHeaders());
+  // Send response with user data and token
+  res.status(200).json({
+    success: true,
+    user,
+    token,
+  });
 });
+
+// exports.loginUser = catchAsyncErrors(async (req, res, next) => {
+//   const { email, password } = req.body;
+
+//   // checking if user has given password and email both
+
+//   if (!email || !password) {
+//     return next(new ErrorHander("Please Enter Email & Password", 400));
+//   }
+
+//   const user = await User.findOne({ email }).select("+password");
+
+//   if (!user) {
+//     return next(new ErrorHander("Invalid email or password", 401));
+//   }
+
+//   const isPasswordMatched = await user.comparePassword(password);
+
+//   if (!isPasswordMatched) {
+//     return next(new ErrorHander("Invalid email or password", 401));
+//   }
+
+//   sendToken(user, 200, res);
+// });
 
 // Logout User
 exports.logout = catchAsyncErrors(async (req, res, next) => {
@@ -189,10 +295,16 @@ exports.updateProfile = catchAsyncErrors(async (req, res, next) => {
 
     await cloudinary.v2.uploader.destroy(imageId);
 
-    const myCloud = await cloudinary.v2.uploader.upload(req.body.avatar, {
+    // Use the retry function for profile update as well
+    const myCloud = await uploadWithRetry(req.body.avatar, {
       folder: "avatars",
       width: 150,
       crop: "scale",
+      quality: "auto",
+      fetch_format: "auto",
+      timeout: 300000,
+      chunk_size: 6000000,
+      resource_type: "auto"
     });
 
     newUserData.avatar = {
@@ -269,7 +381,13 @@ exports.deleteUser = catchAsyncErrors(async (req, res, next) => {
 
   const imageId = user.avatar.public_id;
 
-  await cloudinary.v2.uploader.destroy(imageId);
+  // Add error handling for image deletion
+  try {
+    await cloudinary.v2.uploader.destroy(imageId);
+  } catch (error) {
+    console.error("Error deleting image from Cloudinary:", error);
+    // Continue with user deletion even if image deletion fails
+  }
 
   await user.remove();
 
@@ -292,7 +410,8 @@ exports.generateDesign = catchAsyncErrors(async (req, res) => {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${process.env.API_KEY}`,
-      }
+      },
+      timeout: 60000 // Add request timeout for external API
     });
     const designUrl = response.data.data[0].url;
     res.status(200).json({
@@ -300,17 +419,41 @@ exports.generateDesign = catchAsyncErrors(async (req, res) => {
     });
   } catch (error) {
     console.error('Error generating design:', error);
-    res.status(500).send('Error generating design', error);
+    res.status(500).json({
+      success: false,
+      error: error.response?.data?.error?.message || 'Error generating design'
+    });
   }
-})
+});
 
 exports.proxyImage = catchAsyncErrors(async (req, res) => {
   try {
     const { imageUrl } = req.body;
-    const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+
+    if (!imageUrl) {
+      return res.status(400).json({
+        success: false,
+        error: 'Image URL is required'
+      });
+    }
+
+    const response = await axios.get(imageUrl, {
+      responseType: 'arraybuffer',
+      timeout: 30000 // Add timeout for external image fetch
+    });
+
+    // Set appropriate content type header
+    const contentType = response.headers['content-type'];
+    if (contentType) {
+      res.setHeader('Content-Type', contentType);
+    }
+
     res.send(Buffer.from(response.data, 'binary'));
   } catch (error) {
     console.error('Error proxying image:', error);
-    res.status(500).send('Error proxying image');
+    res.status(500).json({
+      success: false,
+      error: 'Error proxying image'
+    });
   }
 });

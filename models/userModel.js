@@ -26,11 +26,10 @@ const userSchema = new mongoose.Schema({
   avatar: {
     public_id: {
       type: String,
-      required: true,
+
     },
     url: {
       type: String,
-      required: true,
     },
   },
   role: {
@@ -57,7 +56,7 @@ userSchema.pre("save", async function (next) {
 // JWT TOKEN
 userSchema.methods.getJWTToken = function () {
   return jwt.sign({ id: this._id }, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRE,
+    expiresIn: 24 * 60 * 60 * 1000, //process.env.JWT_EXPIRE
   });
 };
 
